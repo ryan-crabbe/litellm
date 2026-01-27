@@ -3,6 +3,11 @@ from typing import Dict, Optional
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.utils import StandardCallbackDynamicParams
 
+# Cache the supported callback params at module level to avoid recomputing on every call
+_SUPPORTED_CALLBACK_PARAMS = frozenset(
+    StandardCallbackDynamicParams.__annotations__.keys()
+)
+
 
 def initialize_standard_callback_dynamic_params(
     kwargs: Optional[Dict] = None,
@@ -15,11 +20,7 @@ def initialize_standard_callback_dynamic_params(
 
     standard_callback_dynamic_params = StandardCallbackDynamicParams()
     if kwargs:
-        _supported_callback_params = (
-            StandardCallbackDynamicParams.__annotations__.keys()
-        )
-
-        for param in _supported_callback_params:
+        for param in _SUPPORTED_CALLBACK_PARAMS:
             if param in kwargs:
                 _param_value = kwargs.pop(param)
                 if (

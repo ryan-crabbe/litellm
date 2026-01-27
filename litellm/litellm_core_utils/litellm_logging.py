@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime as dt_object
@@ -343,25 +344,49 @@ class Logging(LiteLLMLoggingBaseClass):
         ] = []  # for generating complete stream response
         self.log_raw_request_response = log_raw_request_response
 
-        # Initialize dynamic callbacks
-        self.dynamic_input_callbacks: Optional[
+        # Initialize dynamic callbacks - store raw values for lazy processing
+        self._raw_dynamic_input_callbacks: Optional[
             List[Union[str, Callable, CustomLogger]]
         ] = dynamic_input_callbacks
-        self.dynamic_success_callbacks: Optional[
+        self._raw_dynamic_success_callbacks: Optional[
             List[Union[str, Callable, CustomLogger]]
         ] = dynamic_success_callbacks
-        self.dynamic_async_success_callbacks: Optional[
+        self._raw_dynamic_async_success_callbacks: Optional[
             List[Union[str, Callable, CustomLogger]]
         ] = dynamic_async_success_callbacks
-        self.dynamic_failure_callbacks: Optional[
+        self._raw_dynamic_failure_callbacks: Optional[
             List[Union[str, Callable, CustomLogger]]
         ] = dynamic_failure_callbacks
-        self.dynamic_async_failure_callbacks: Optional[
+        self._raw_dynamic_async_failure_callbacks: Optional[
             List[Union[str, Callable, CustomLogger]]
         ] = dynamic_async_failure_callbacks
 
-        # Process dynamic callbacks
-        self.process_dynamic_callbacks()
+        # Initialize processed caches (None = not yet processed)
+        self._processed_dynamic_input_callbacks: Optional[
+            List[Union[str, Callable, CustomLogger]]
+        ] = None
+        self._processed_dynamic_success_callbacks: Optional[
+            List[Union[str, Callable, CustomLogger]]
+        ] = None
+        self._processed_dynamic_async_success_callbacks: Optional[
+            List[Union[str, Callable, CustomLogger]]
+        ] = None
+        self._processed_dynamic_failure_callbacks: Optional[
+            List[Union[str, Callable, CustomLogger]]
+        ] = None
+        self._processed_dynamic_async_failure_callbacks: Optional[
+            List[Union[str, Callable, CustomLogger]]
+        ] = None
+
+        # Processing flags for lazy evaluation groups
+        self._input_callbacks_processed: bool = False
+        self._success_group_processed: bool = False
+        self._failure_group_processed: bool = False
+
+        # Lock for thread-safe callback processing (used in realtime streaming)
+        self._callback_processing_lock: threading.Lock = threading.Lock()
+
+        # Dynamic callbacks are now processed lazily via @property accessors
 
         ## DYNAMIC LANGFUSE / GCS / logging callback KEYS ##
         self.standard_callback_dynamic_params: StandardCallbackDynamicParams = (
@@ -400,36 +425,144 @@ class Logging(LiteLLMLoggingBaseClass):
             "model": model,
         }
 
-    def process_dynamic_callbacks(self):
+    # ==================== DYNAMIC CALLBACK PROPERTIES (Lazy Evaluation) ====================
+
+    @property
+    def dynamic_input_callbacks(self) -> Optional[List[Union[str, Callable, CustomLogger]]]:
+        """Lazily process and return dynamic_input_callbacks."""
+        if self._raw_dynamic_input_callbacks is None:
+            return None
+        if not self._input_callbacks_processed:
+            self._processed_dynamic_input_callbacks = self._process_dynamic_callback_list(
+                self._raw_dynamic_input_callbacks, dynamic_callbacks_type="input"
+            )
+            self._input_callbacks_processed = True
+        return self._processed_dynamic_input_callbacks
+
+    @dynamic_input_callbacks.setter
+    def dynamic_input_callbacks(
+        self, value: Optional[List[Union[str, Callable, CustomLogger]]]
+    ) -> None:
+        """Setter for backward compatibility."""
+        self._raw_dynamic_input_callbacks = value
+        self._processed_dynamic_input_callbacks = None
+        self._input_callbacks_processed = False
+
+    @property
+    def dynamic_success_callbacks(self) -> Optional[List[Union[str, Callable, CustomLogger]]]:
+        """Lazily process and return dynamic_success_callbacks."""
+        if not self._success_group_processed:
+            self._process_success_group()
+        return self._processed_dynamic_success_callbacks
+
+    @dynamic_success_callbacks.setter
+    def dynamic_success_callbacks(
+        self, value: Optional[List[Union[str, Callable, CustomLogger]]]
+    ) -> None:
+        """Setter for backward compatibility."""
+        self._raw_dynamic_success_callbacks = value
+        self._processed_dynamic_success_callbacks = None
+        self._success_group_processed = False
+
+    @property
+    def dynamic_async_success_callbacks(self) -> Optional[List[Union[str, Callable, CustomLogger]]]:
+        """Lazily process and return dynamic_async_success_callbacks."""
+        if not self._success_group_processed:
+            self._process_success_group()
+        return self._processed_dynamic_async_success_callbacks
+
+    @dynamic_async_success_callbacks.setter
+    def dynamic_async_success_callbacks(
+        self, value: Optional[List[Union[str, Callable, CustomLogger]]]
+    ) -> None:
+        """Setter for backward compatibility."""
+        self._raw_dynamic_async_success_callbacks = value
+        self._processed_dynamic_async_success_callbacks = None
+        self._success_group_processed = False
+
+    @property
+    def dynamic_failure_callbacks(self) -> Optional[List[Union[str, Callable, CustomLogger]]]:
+        """Lazily process and return dynamic_failure_callbacks."""
+        if not self._failure_group_processed:
+            self._process_failure_group()
+        return self._processed_dynamic_failure_callbacks
+
+    @dynamic_failure_callbacks.setter
+    def dynamic_failure_callbacks(
+        self, value: Optional[List[Union[str, Callable, CustomLogger]]]
+    ) -> None:
+        """Setter for backward compatibility."""
+        self._raw_dynamic_failure_callbacks = value
+        self._processed_dynamic_failure_callbacks = None
+        self._failure_group_processed = False
+
+    @property
+    def dynamic_async_failure_callbacks(self) -> Optional[List[Union[str, Callable, CustomLogger]]]:
+        """Lazily process and return dynamic_async_failure_callbacks."""
+        if not self._failure_group_processed:
+            self._process_failure_group()
+        return self._processed_dynamic_async_failure_callbacks
+
+    @dynamic_async_failure_callbacks.setter
+    def dynamic_async_failure_callbacks(
+        self, value: Optional[List[Union[str, Callable, CustomLogger]]]
+    ) -> None:
+        """Setter for backward compatibility."""
+        self._raw_dynamic_async_failure_callbacks = value
+        self._processed_dynamic_async_failure_callbacks = None
+        self._failure_group_processed = False
+
+    # ==================== GROUP PROCESSING HELPERS ====================
+
+    def _process_success_group(self) -> None:
         """
-        Initializes CustomLogger compatible callbacks in self.dynamic_* callbacks
+        Process both success and async_success callbacks together.
+        Handles the cross-callback dependency where processing 'success'
+        adds items to 'async_success'.
 
-        If a callback is in litellm._known_custom_logger_compatible_callbacks, it needs to be intialized and added to the respective dynamic_* callback list.
+        Thread-safe: Uses lock to prevent race conditions in concurrent access
+        (e.g., realtime streaming where both sync and async handlers run together).
         """
-        # Process input callbacks
-        self.dynamic_input_callbacks = self._process_dynamic_callback_list(
-            self.dynamic_input_callbacks, dynamic_callbacks_type="input"
-        )
+        with self._callback_processing_lock:
+            if self._success_group_processed:
+                return
 
-        # Process failure callbacks
-        self.dynamic_failure_callbacks = self._process_dynamic_callback_list(
-            self.dynamic_failure_callbacks, dynamic_callbacks_type="failure"
-        )
+            # Process async_success FIRST to ensure the list exists for appending
+            self._processed_dynamic_async_success_callbacks = self._process_dynamic_callback_list(
+                self._raw_dynamic_async_success_callbacks, dynamic_callbacks_type="async_success"
+            )
 
-        # Process async failure callbacks
-        self.dynamic_async_failure_callbacks = self._process_dynamic_callback_list(
-            self.dynamic_async_failure_callbacks, dynamic_callbacks_type="async_failure"
-        )
+            # Now process success callbacks - this may append to async_success
+            self._processed_dynamic_success_callbacks = self._process_dynamic_callback_list(
+                self._raw_dynamic_success_callbacks, dynamic_callbacks_type="success"
+            )
 
-        # Process success callbacks
-        self.dynamic_success_callbacks = self._process_dynamic_callback_list(
-            self.dynamic_success_callbacks, dynamic_callbacks_type="success"
-        )
+            self._success_group_processed = True
 
-        # Process async success callbacks
-        self.dynamic_async_success_callbacks = self._process_dynamic_callback_list(
-            self.dynamic_async_success_callbacks, dynamic_callbacks_type="async_success"
-        )
+    def _process_failure_group(self) -> None:
+        """
+        Process both failure and async_failure callbacks together.
+        Handles the cross-callback dependency where processing 'failure'
+        adds items to 'async_failure'.
+
+        Thread-safe: Uses lock to prevent race conditions in concurrent access
+        (e.g., realtime streaming where both sync and async handlers run together).
+        """
+        with self._callback_processing_lock:
+            if self._failure_group_processed:
+                return
+
+            # Process async_failure FIRST to ensure the list exists for appending
+            self._processed_dynamic_async_failure_callbacks = self._process_dynamic_callback_list(
+                self._raw_dynamic_async_failure_callbacks, dynamic_callbacks_type="async_failure"
+            )
+
+            # Now process failure callbacks - this may append to async_failure
+            self._processed_dynamic_failure_callbacks = self._process_dynamic_callback_list(
+                self._raw_dynamic_failure_callbacks, dynamic_callbacks_type="failure"
+            )
+
+            self._failure_group_processed = True
 
     def _process_dynamic_callback_list(
         self,
@@ -462,14 +595,15 @@ class Logging(LiteLLMLoggingBaseClass):
                     processed_list.append(callback_class)
 
                     # If processing dynamic_success_callbacks, add to dynamic_async_success_callbacks
+                    # Note: Use _processed_* directly to avoid property accessor recursion
                     if dynamic_callbacks_type == "success":
-                        if self.dynamic_async_success_callbacks is None:
-                            self.dynamic_async_success_callbacks = []
-                        self.dynamic_async_success_callbacks.append(callback_class)
+                        if self._processed_dynamic_async_success_callbacks is None:
+                            self._processed_dynamic_async_success_callbacks = []
+                        self._processed_dynamic_async_success_callbacks.append(callback_class)
                     elif dynamic_callbacks_type == "failure":
-                        if self.dynamic_async_failure_callbacks is None:
-                            self.dynamic_async_failure_callbacks = []
-                        self.dynamic_async_failure_callbacks.append(callback_class)
+                        if self._processed_dynamic_async_failure_callbacks is None:
+                            self._processed_dynamic_async_failure_callbacks = []
+                        self._processed_dynamic_async_failure_callbacks.append(callback_class)
             else:
                 processed_list.append(callback)
         return processed_list
