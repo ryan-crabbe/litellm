@@ -17,7 +17,7 @@ from typing import Any, List, Literal, Optional, Set, Tuple, cast
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
-from fastapi import HTTPException
+from fastapi import HTTPException, status
 import jwt
 from jwt.api_jwk import PyJWK
 
@@ -825,8 +825,14 @@ class JWTHandler:
                 return payload
 
             except jwt.ExpiredSignatureError:
-                # the token is expired, do something to refresh it
-                raise Exception("Token Expired")
+                # the token is expired - surface it as a 401 so the status
+                # code is preserved end-to-end (client response + OTel traces).
+                raise ProxyException(
+                    message="Token Expired",
+                    type=ProxyErrorTypes.expired_key,
+                    param=None,
+                    code=status.HTTP_401_UNAUTHORIZED,
+                )
             except Exception as e:
                 raise Exception(f"Validation fails: {str(e)}")
         elif public_key is not None and isinstance(public_key, str):
@@ -851,8 +857,14 @@ class JWTHandler:
                 return payload
 
             except jwt.ExpiredSignatureError:
-                # the token is expired, do something to refresh it
-                raise Exception("Token Expired")
+                # the token is expired - surface it as a 401 so the status
+                # code is preserved end-to-end (client response + OTel traces).
+                raise ProxyException(
+                    message="Token Expired",
+                    type=ProxyErrorTypes.expired_key,
+                    param=None,
+                    code=status.HTTP_401_UNAUTHORIZED,
+                )
             except Exception as e:
                 raise Exception(f"Validation fails: {str(e)}")
 

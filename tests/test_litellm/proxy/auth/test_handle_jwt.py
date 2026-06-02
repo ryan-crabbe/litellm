@@ -3179,3 +3179,91 @@ def test_build_decode_kwargs_no_warning_when_scoped(
         if "neither JWT_AUDIENCE nor JWT_ISSUER" in r.getMessage()
     ]
     assert matching == []
+
+
+@pytest.mark.asyncio
+async def test_auth_jwt_expired_token_raises_401_jwk_path():
+    """
+    An expired JWT (access token) decoded via the JWK/dict public-key path must
+    raise a ProxyException carrying a 401 status code.
+
+    Previously this raised a bare ``Exception("Token Expired")`` with no status
+    code. That codeless exception was logged to OTel before being re-wrapped, so
+    traces showed a generic 500 even though the client received a 401. Raising a
+    401-bearing exception at the source keeps the status code consistent
+    end-to-end (client response + OTel ``http.response.status_code``).
+    """
+    import jwt as jwt_lib
+
+    jwt_handler = JWTHandler()
+    jwt_handler.litellm_jwtauth = LiteLLM_JWTAuth()
+
+    with (
+        patch.object(
+            jwt_handler, "get_public_key", new_callable=AsyncMock
+        ) as mock_get_public_key,
+        patch(
+            "litellm.proxy.auth.handle_jwt.jwt.get_unverified_header",
+            return_value={"kid": "test-kid"},
+        ),
+        patch(
+            "litellm.proxy.auth.handle_jwt.PyJWK.from_dict",
+            return_value=MagicMock(key="fake-key"),
+        ),
+        patch(
+            "litellm.proxy.auth.handle_jwt.jwt.decode",
+            side_effect=jwt_lib.ExpiredSignatureError("Signature has expired"),
+        ),
+    ):
+        # dict public key -> JWK decode branch
+        mock_get_public_key.return_value = {"kty": "RSA", "kid": "test-kid"}
+
+        with pytest.raises(ProxyException) as exc_info:
+            await jwt_handler.auth_jwt(token="expired.jwt.token")
+
+    assert exc_info.value.code == str(401)
+    assert exc_info.value.type == ProxyErrorTypes.expired_key.value
+    assert "Token Expired" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_auth_jwt_expired_token_raises_401_pem_cert_path():
+    """
+    Same as above but for the PEM-certificate (string public-key) decode path.
+    """
+    import jwt as jwt_lib
+
+    jwt_handler = JWTHandler()
+    jwt_handler.litellm_jwtauth = LiteLLM_JWTAuth()
+
+    mock_cert = MagicMock()
+    mock_cert.public_key.return_value.public_bytes.return_value = b"fake-key"
+
+    with (
+        patch.object(
+            jwt_handler, "get_public_key", new_callable=AsyncMock
+        ) as mock_get_public_key,
+        patch(
+            "litellm.proxy.auth.handle_jwt.jwt.get_unverified_header",
+            return_value={"kid": "test-kid"},
+        ),
+        patch(
+            "litellm.proxy.auth.handle_jwt.x509.load_pem_x509_certificate",
+            return_value=mock_cert,
+        ),
+        patch(
+            "litellm.proxy.auth.handle_jwt.jwt.decode",
+            side_effect=jwt_lib.ExpiredSignatureError("Signature has expired"),
+        ),
+    ):
+        # string public key -> PEM certificate decode branch
+        mock_get_public_key.return_value = (
+            "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----"
+        )
+
+        with pytest.raises(ProxyException) as exc_info:
+            await jwt_handler.auth_jwt(token="expired.jwt.token")
+
+    assert exc_info.value.code == str(401)
+    assert exc_info.value.type == ProxyErrorTypes.expired_key.value
+    assert "Token Expired" in exc_info.value.message
